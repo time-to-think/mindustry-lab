@@ -18,6 +18,7 @@ from .learning import (
 )
 from .llm import OpenAICompatibleLlm
 from .policy import compact_state
+from .timing import CycleTimer
 
 
 STOCKPILE_RTS_REFRESH_SECONDS = 0.5
@@ -377,7 +378,8 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
 
     turns = 0
     while True:
-        state = game.state()
+        cycle = CycleTimer()
+        state = cycle.call("state_retrieval", game.state)
         if str(state.get("episode_id")) != episode_id:
             previous = state.get("previous_episode_result")
             previous = previous if isinstance(previous, dict) else {}
@@ -408,15 +410,16 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
         decision_state["infrastructure_backlog"] = infrastructure_backlog.for_prompt()
         decision_state["recent_defense_outcomes"] = defense_outcomes_for_prompt(event_history)
         try:
-            compact_decision_state = compact_state(decision_state)
-            llm_result = llm.decide(
-                compact_decision_state, recent_results, events_for_prompt(event_history),
+            compact_decision_state = cycle.call("state_compaction", compact_state, decision_state)
+            llm_result = cycle.call(
+                "llm_decide", llm.decide, compact_decision_state, recent_results, events_for_prompt(event_history),
                 strategic_context, action_failures.for_prompt(),
             )
         except (ValueError, HttpJsonError) as error:
             run_log.write({
                 "kind": "turn_error", "at": utc_now(), "turn": turns,
                 "episode_id": episode_id, "error": type(error).__name__, "message": str(error),
+                "python_timing": cycle.snapshot(),
             })
             if (
                 isinstance(error, HttpJsonError)
@@ -444,8 +447,8 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
             retry_delay = decision_delay(state, max(2.0, config.decision_interval_seconds), 2.0)
             time.sleep(retry_delay)
             continue
-        decision, requested_actions, preflight_skips = prepare_decision_actions(
-            compact_decision_state, llm_result.decision
+        decision, requested_actions, preflight_skips = cycle.call(
+            "action_preparation", prepare_decision_actions, compact_decision_state, llm_result.decision
         )
         previous_objective = strategic_context.get("objective")
         next_objective = decision["strategic_intent"].get("objective", "")
@@ -465,7 +468,7 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
         }
         action_observed_tick = float(state.get("tick", 0))
         if not dry_run:
-            latest_before_action = game.state()
+            latest_before_action = cycle.call("state_revalidation", game.state)
             latest_episode_id = str(latest_before_action.get("episode_id"))
             if (
                 latest_episode_id != episode_id
@@ -478,12 +481,13 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
                     "reason": "game_over_during_inference",
                     "state": latest_before_action,
                     "discarded_turn": turns,
+                    "python_timing": cycle.snapshot(),
                     "discarded_decision": decision,
                     "llm_latency_seconds": llm_result.latency_seconds,
                     "llm_usage": llm_result.usage,
                 })
                 break
-            latest_compact_state = compact_state(latest_before_action)
+            latest_compact_state = cycle.call("execution_compaction", compact_state, latest_before_action)
             action_observed_tick = float(latest_before_action.get("tick", action_observed_tick))
             refreshed_actions, execution_time_skips = preflight_rts_queue_actions(
                 latest_compact_state, decision["actions"]
@@ -498,8 +502,8 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
             action_response = {"request_id": request_id, "dry_run": True, "results": []}
         else:
             try:
-                action_response = game.act(
-                    request_id,
+                action_response = cycle.call(
+                    "action_submission", game.act, request_id,
                     decision["actions"],
                     expected_episode_id=episode_id,
                     observed_tick=action_observed_tick,
@@ -548,6 +552,7 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
             "llm_json_repair_attempted": llm_result.repair_attempted,
             "llm_validation_skips": list(llm_result.validation_skips),
             "effective_wait_seconds": effective_wait_seconds,
+            "python_timing": cycle.snapshot(),
         }
         run_log.write(record)
         action_failures.update(
