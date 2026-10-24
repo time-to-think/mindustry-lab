@@ -36,6 +36,8 @@ Generated builds, downloaded game files, credentials, logs, and local agent stat
 
 ### macOS or Linux
 
+For SourceTree setup and runtime troubleshooting, see the [macOS developer guide](docs/macos-setup.md).
+
 - Bash
 - JDK 17
 - Python 3.10 or newer
@@ -48,6 +50,23 @@ On macOS, a Temurin 17 installation works well. Verify the tools before starting
 java -version
 python3 --version
 ollama list
+```
+
+The shell launchers validate Python 3.10+ and JDK 17 before use. Python is
+selected from `python3`, then `python` on PATH. To use another installation,
+set `MINDUSTRY_AGENT_PYTHON` to its executable path. An explicit override must
+pass validation; it is never silently replaced.
+
+Set `JAVA_HOME` to JDK 17 if it is already configured for another version.
+Without `JAVA_HOME`, macOS launchers try `/usr/libexec/java_home -v 17`, then
+validate Java on PATH. A full JDK with `javac` is required. The selected JDK's
+home and bin directory are exported for both Gradle builds and game processes.
+
+```bash
+export MINDUSTRY_AGENT_PYTHON="/absolute/path/to/python3.13"
+# macOS:
+export JAVA_HOME="$(/usr/libexec/java_home -v 17)"
+# On Linux, set JAVA_HOME to your JDK 17 installation instead.
 ```
 
 ### Windows

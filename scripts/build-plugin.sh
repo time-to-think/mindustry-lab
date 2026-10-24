@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 source "$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/common.sh"
 
-find_java >/dev/null
+use_java17
 export GRADLE_USER_HOME="${GRADLE_USER_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/mindustry-lab/gradle}"
 
 cd "$REPO_ROOT"
