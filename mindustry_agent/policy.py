@@ -614,12 +614,6 @@ def _pvp_objective_state(state: dict[str, Any]) -> dict[str, Any]:
         for point in points:
             owner = str(point.get("owner", "neutral"))
             owner_counts[owner] = owner_counts.get(owner, 0) + 1
-        north_active = any(
-            point.get("id") == "north_industry"
-            and str(point.get("owner", "neutral")) == self_name
-            and point.get("benefit_active", True) is not False
-            for point in points
-        )
         own_points = owner_counts.get(self_name, 0)
         enemy_points = max(
             (count for owner, count in owner_counts.items()
@@ -637,24 +631,18 @@ def _pvp_objective_state(state: dict[str, Any]) -> dict[str, Any]:
             "most_owned_by_one_opponent": enemy_points,
             "neutral": owner_counts.get("neutral", 0),
             "ownership_by_team": owner_counts,
-            "north_unit_training_and_upgrade_speed_bonus_fraction": benefits.get(
-                "north_unit_training_and_upgrade_speed_bonus_fraction", 0.1
+            "north_combat_unit_damage_multiplier": benefits.get(
+                "north_combat_unit_damage_multiplier", 1.15
             ),
-            "center_operational_intelligence_active": benefits.get(
-                "center_operational_intelligence_active", False
+            "center_combat_unit_speed_multiplier": benefits.get(
+                "center_combat_unit_speed_multiplier", 1.15
             ),
-            "south_friendly_unit_repair_max_health_fraction_per_second_in_radius": benefits.get(
-                "south_friendly_unit_repair_max_health_fraction_per_second_in_radius", 0.01
-            ),
-            "south_friendly_structure_repair_max_health_fraction_per_second_in_radius": benefits.get(
-                "south_friendly_structure_repair_max_health_fraction_per_second_in_radius", 0.005
+            "south_combat_unit_incoming_damage_divisor": benefits.get(
+                "south_combat_unit_incoming_damage_divisor", 1.15
             ),
             "takeover_requires_neutralization": benefits.get("takeover_requires_neutralization", True),
             "neutral_lock_seconds_after_enemy_neutralization": benefits.get(
                 "neutral_lock_seconds_after_enemy_neutralization", 5.0
-            ),
-            "current_production_and_upgrade_speed_multiplier": benefits.get(
-                "current_production_and_upgrade_speed_multiplier", 1.1 if north_active else 1.0
             ),
             "teams": benefits.get("teams", {}),
         }
@@ -959,6 +947,271 @@ def _stockpile_rts_production_state(
     }
 
 
+def _compact_recent_unit_combat(raw: Any) -> dict[str, Any]:
+    """Preserve combat outcomes without resending hundreds of individual hit records."""
+    if not isinstance(raw, dict):
+        return {}
+
+    def compact_side(side: Any) -> dict[str, Any]:
+        if not isinstance(side, dict):
+            return {}
+        result: dict[str, Any] = {"team": side.get("team")}
+        for window in ("last_10_seconds", "last_30_seconds"):
+            value = side.get(window) if isinstance(side.get(window), dict) else {}
+            result[window] = {
+                "raw_damage": value.get("raw_damage", 0),
+                "hits": value.get("hits", 0),
+                "by_attacker_unit": value.get("by_attacker_unit", [])[:10],
+            }
+        result["recent_events"] = [
+            {
+                key: event.get(key) for key in (
+                    "seconds_ago", "attacker_unit", "target_team", "target_kind",
+                    "target_type", "raw_damage", "x", "y",
+                ) if event.get(key) is not None
+            }
+            for event in side.get("recent_events", [])[-6:] if isinstance(event, dict)
+        ]
+        result["recent_events_omitted"] = max(
+            int(side.get("recent_events_omitted", 0) or 0),
+            max(0, len(side.get("recent_events", [])) - 6),
+        )
+        return result
+
+    return {
+        "meaning": raw.get("meaning"),
+        "self": compact_side(raw.get("self")),
+        "opponents": [compact_side(side) for side in raw.get("opponents", [])],
+    }
+
+
+def _stockpile_rts_operational_summary(
+    state: dict[str, Any], production: dict[str, Any], objective: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose coordination facts that otherwise require joining several large RTS tables."""
+    friendly = [
+        unit for unit in state.get("friendly_units", [])
+        if isinstance(unit, dict) and unit.get("commandable")
+    ]
+    enemy = [unit for unit in state.get("enemy_units", []) if isinstance(unit, dict)]
+    squads = [squad for squad in state.get("rts_squads", []) if isinstance(squad, dict)]
+    assigned_ids = {
+        int(unit_id) for squad in squads for unit_id in squad.get("member_ids", [])
+        if isinstance(unit_id, (int, float))
+    }
+    pending_units = sum(
+        int(queue.get("remaining", 0) or 0)
+        for queue in state.get("rts_training_queues", [])
+        if isinstance(queue, dict) and queue.get("status") == "training"
+    )
+    combat_modes = {"attack", "attack_move", "defend"}
+    combat_squads = [squad for squad in squads if squad.get("mode") in combat_modes]
+    small_combat_squads = [
+        squad for squad in combat_squads if int(squad.get("member_count", 0) or 0) <= 2
+    ]
+    factories = production.get("factories", []) if isinstance(production, dict) else []
+    instances = [
+        instance for factory in factories if isinstance(factory, dict)
+        for instance in factory.get("existing_instances", []) if isinstance(instance, dict)
+    ]
+    unit_types: dict[str, int] = {}
+    for unit in friendly:
+        unit_type = str(unit.get("type", "unknown"))
+        unit_types[unit_type] = unit_types.get(unit_type, 0) + 1
+    enemy_types: dict[str, int] = {}
+    for unit in enemy:
+        unit_type = str(unit.get("type", "unknown"))
+        enemy_types[unit_type] = enemy_types.get(unit_type, 0) + 1
+    enemy_progress = objective.get("enemy_core_health_progress", {}) if isinstance(objective, dict) else {}
+    pending_construction = [
+        row for row in state.get("rts_construction_queue", [])
+        if isinstance(row, dict) and row.get("status") == "queued"
+    ]
+    next_construction = sorted(
+        pending_construction,
+        key=lambda row: float(row.get("seconds_until_completion", 0) or 0),
+    )[:6]
+    return {
+        "meaning": (
+            "Joined current coordination facts, not a required army size, timing threshold, composition, or build order."
+        ),
+        "force_now": {
+            "commandable_combat_units": len(friendly),
+            "by_type": unit_types,
+            "assigned_to_squads": sum(1 for unit in friendly if unit.get("id") in assigned_ids),
+            "unassigned": sum(1 for unit in friendly if unit.get("id") not in assigned_ids),
+            "pending_training_units": pending_units,
+        },
+        "opponent_force_now": {"visible_units": len(enemy), "by_type": enemy_types},
+        "coordination": {
+            "combat_squads": len(combat_squads),
+            "combat_squads_with_1_or_2_members": len(small_combat_squads),
+            "members_in_combat_orders": sum(
+                int(squad.get("member_count", 0) or 0) for squad in combat_squads
+            ),
+            "pending_reinforcements_attached_to_combat_orders": sum(
+                int(squad.get("pending_training_units", 0) or 0) for squad in combat_squads
+            ),
+            "stalled_squads": sum(bool(squad.get("stalled")) for squad in squads),
+        },
+        "production_capacity": {
+            "completed_factory_slots": len(instances),
+            "free_factory_slots": sum(bool(row.get("available_for_new_order")) for row in instances),
+            "active_training_queues": sum(
+                isinstance(queue, dict) and queue.get("status") == "training"
+                for queue in state.get("rts_training_queues", [])
+            ),
+            "active_upgrade_queues": sum(
+                isinstance(queue, dict) and queue.get("status") == "upgrading"
+                for queue in state.get("rts_upgrade_queues", [])
+            ),
+        },
+        "construction_capacity": {
+            "parallel_slots": 2,
+            "pending_orders": len(pending_construction),
+            "occupied_slots": len({
+                int(row.get("construction_slot", 0) or 0)
+                for row in pending_construction if row.get("construction_slot")
+            }),
+            "next_completions": [
+                {
+                    key: row.get(key) for key in (
+                        "block", "x", "y", "construction_slot",
+                        "seconds_until_start", "seconds_until_completion",
+                    ) if row.get(key) is not None
+                }
+                for row in next_construction
+            ],
+        },
+        "victory_progress": {
+            "enemy_core_damage_fraction": enemy_progress.get("damage_fraction", 0),
+            "enemy_cores_remaining": objective.get("enemy_cores_remaining"),
+        },
+    }
+
+
+def _stockpile_rts_action_availability(
+    state: dict[str, Any], production: dict[str, Any],
+) -> dict[str, Any]:
+    """Join exact current RTS action gates so the model need not infer them across tables."""
+    ready_factories: list[dict[str, Any]] = []
+    busy_factories: list[dict[str, Any]] = []
+    for factory in production.get("factories", []) if isinstance(production, dict) else []:
+        if not isinstance(factory, dict):
+            continue
+        supported_units = [
+            plan.get("unit") for plan in factory.get("plans", [])
+            if isinstance(plan, dict) and plan.get("unit")
+        ]
+        for instance in factory.get("existing_instances", []):
+            if not isinstance(instance, dict):
+                continue
+            row = {
+                "facility_id": instance.get("facility_id"),
+                "supported_units": supported_units,
+            }
+            if instance.get("available_for_new_order"):
+                ready_factories.append(row)
+            else:
+                queue = instance.get("active_queue") if isinstance(instance.get("active_queue"), dict) else {}
+                busy_factories.append({
+                    **row,
+                    "active_unit": queue.get("unit"),
+                    "remaining": queue.get("remaining"),
+                    "seconds_until_next_unit": queue.get("seconds_until_next_unit"),
+                })
+
+    ready_reconstructors: list[dict[str, Any]] = []
+    busy_reconstructors: list[dict[str, Any]] = []
+    for reconstructor in production.get("reconstructors", []) if isinstance(production, dict) else []:
+        if not isinstance(reconstructor, dict):
+            continue
+        startable_pairs = [
+            {
+                "from_unit": upgrade.get("from_unit"),
+                "to_unit": upgrade.get("to_unit"),
+                "maximum_startable_now": upgrade.get(
+                    "maximum_startable_now_from_resources_and_units", 0
+                ),
+            }
+            for upgrade in reconstructor.get("upgrades", [])
+            if isinstance(upgrade, dict)
+            and int(upgrade.get("maximum_startable_now_from_resources_and_units", 0) or 0) > 0
+        ]
+        for instance in reconstructor.get("existing_instances", []):
+            if not isinstance(instance, dict):
+                continue
+            row = {
+                "facility_id": instance.get("facility_id"),
+                "startable_pairs_now": startable_pairs,
+            }
+            if instance.get("available_for_new_order"):
+                ready_reconstructors.append(row)
+            else:
+                queue = instance.get("active_queue") if isinstance(instance.get("active_queue"), dict) else {}
+                busy_reconstructors.append({
+                    **row,
+                    "active_pair": {
+                        "from_unit": queue.get("from_unit"),
+                        "to_unit": queue.get("to_unit"),
+                    },
+                    "remaining": queue.get("remaining"),
+                    "seconds_until_next_unit": queue.get("seconds_until_next_unit"),
+                })
+
+    blocked_orders: list[dict[str, Any]] = []
+    assigned_ids: set[int] = set()
+    for squad in state.get("rts_squads", []):
+        if not isinstance(squad, dict):
+            continue
+        assigned_ids.update(
+            int(unit_id) for unit_id in squad.get("member_ids", [])
+            if isinstance(unit_id, (int, float))
+        )
+        if (
+            int(squad.get("member_count", 0) or 0) <= 0
+            and int(squad.get("pending_training_units", 0) or 0) <= 0
+        ):
+            continue
+        target = squad.get("target") if isinstance(squad.get("target"), dict) else {}
+        blocked_orders.append({
+            "squad_id": squad.get("squad_id"),
+            "mode": squad.get("mode"),
+            "target_x": target.get("x"),
+            "target_y": target.get("y"),
+            "target_unit_id": squad.get("target_unit_id"),
+            "engagement_radius": int(squad.get("engagement_radius", 14) or 14),
+            "member_count": int(squad.get("member_count", 0) or 0),
+            "pending_training_units": int(squad.get("pending_training_units", 0) or 0),
+            "execution_status": squad.get("execution_status"),
+        })
+
+    defender = state.get("core_defender") if isinstance(state.get("core_defender"), dict) else {}
+    defender_id = defender.get("id") if defender.get("active") else None
+    unassigned_by_type: dict[str, list[int]] = {}
+    for unit in state.get("friendly_units", []):
+        if not isinstance(unit, dict) or not unit.get("commandable"):
+            continue
+        unit_id = unit.get("id")
+        if not isinstance(unit_id, int) or unit_id == defender_id or unit_id in assigned_ids:
+            continue
+        unassigned_by_type.setdefault(str(unit.get("type", "unknown")), []).append(unit_id)
+
+    return {
+        "meaning": (
+            "Exact feasibility snapshot, not strategy. Use only ready facility IDs for new queue orders. "
+            "An identical command_units order listed under active_persistent_order_signatures is already "
+            "executing and will be dropped unless explicit new unit_ids change its membership."
+        ),
+        "ready_factory_slots": ready_factories,
+        "busy_factory_slots_do_not_accept_orders": busy_factories,
+        "ready_reconstructor_slots": ready_reconstructors,
+        "busy_reconstructor_slots_do_not_accept_orders": busy_reconstructors,
+        "active_persistent_order_signatures_do_not_repeat": blocked_orders,
+        "unassigned_commandable_unit_ids_by_type": unassigned_by_type,
+    }
+
+
 def _is_stockpile_rts_production_block(block: dict[str, Any]) -> bool:
     return bool(block.get("unit_plans")) or bool(block.get("unit_upgrades"))
 
@@ -992,6 +1245,10 @@ def _stockpile_rts_defense_state(
         and (bool(block.get("affordable_now")) or str(block.get("name")) in existing_block_names)
     ]
     defense_names = {str(block.get("name")) for block in defense_blocks if block.get("name")}
+    defense_size_by_name = {
+        str(block.get("name")): int(block.get("size", 1) or 1)
+        for block in defense_blocks if block.get("name")
+    }
     ammo_columns = [
         "resource", "estimated_dps", "splash_damage", "splash_radius_tiles",
         "building_damage_multiplier", "hits_air", "hits_ground", "armor_piercing",
@@ -1026,6 +1283,26 @@ def _stockpile_rts_defense_state(
         name = str(building.get("block"))
         existing_counts[name] = existing_counts.get(name, 0) + 1
 
+    def representative_zones(placements: list[Any]) -> list[dict[str, Any]]:
+        """Keep one exact anchor per observed line instead of x-sorted near-duplicates."""
+        selected: list[dict[str, Any]] = []
+        seen_zones: set[str] = set()
+        valid = [placement for placement in placements if isinstance(placement, dict)]
+        for wanted in ("base_gate", "lane_screen", "forward_choke"):
+            match = next((row for row in valid if row.get("defensive_zone") == wanted), None)
+            if match is not None:
+                selected.append(match)
+                seen_zones.add(wanted)
+        for placement in valid:
+            if len(selected) >= 3:
+                break
+            zone = str(placement.get("defensive_zone"))
+            if zone in seen_zones and zone != "None":
+                continue
+            selected.append(placement)
+            seen_zones.add(zone)
+        return selected
+
     raw = state.get("defense_analysis") if isinstance(state.get("defense_analysis"), dict) else {}
     approaches: list[dict[str, Any]] = []
     for direction in raw.get("approach_directions", []):
@@ -1038,40 +1315,59 @@ def _stockpile_rts_defense_state(
                 if str(name) not in defense_names or not isinstance(placements, list):
                     continue
                 turret_tables[str(name)] = {
-                    "columns": ["x", "y", "ground_route_intervals", "air_route_distance_intervals"],
+                    "columns": [
+                        "x", "y", "distance_from_core_tiles", "anchor_steps_from_core",
+                        "defensive_zone", "frontline_relation", "ground_route_intervals",
+                        "air_route_distance_intervals",
+                    ],
                     "rows": [
                         [
                             placement.get("x"), placement.get("y"),
+                            placement.get("distance_from_core_tiles"),
+                            placement.get("anchor_steps_from_core"),
+                            placement.get("defensive_zone"),
+                            placement.get("frontline_relation"),
                             placement.get("ground_route_intervals", []),
                             placement.get("air_route_distance_intervals", []),
                         ]
-                        for placement in placements[:2] if isinstance(placement, dict)
+                        for placement in representative_zones(placements)
                     ],
                 }
-        wall_tables: dict[str, Any] = {}
+        wall_groups: dict[int, dict[str, Any]] = {}
         raw_walls = direction.get("valid_wall_placement_samples", {})
         if isinstance(raw_walls, dict):
             for name, placements in raw_walls.items():
                 if str(name) not in defense_names or not isinstance(placements, list):
                     continue
-                wall_tables[str(name)] = {
-                    "columns": ["x", "y", "steps_from_core"],
-                    "rows": [
-                        [placement.get("x"), placement.get("y"), placement.get("steps_from_core")]
-                        for placement in placements[:2] if isinstance(placement, dict)
+                size = defense_size_by_name.get(str(name), 1)
+                group = wall_groups.setdefault(size, {
+                    "structure_size": size,
+                    "compatible_walls": [],
+                    "columns": [
+                        "x", "y", "steps_from_core", "defensive_zone", "frontline_relation",
                     ],
-                }
+                    "rows": [],
+                })
+                group["compatible_walls"].append(str(name))
+                if not group["rows"]:
+                    group["rows"] = [
+                        [
+                            placement.get("x"), placement.get("y"), placement.get("steps_from_core"),
+                            placement.get("defensive_zone"), placement.get("frontline_relation"),
+                        ]
+                        for placement in representative_zones(placements)
+                    ]
         approaches.append({
             key: direction.get(key)
             for key in (
-                "direction_id", "spawn", "ground_route_reachable", "ground_route_length_tiles",
+                "direction_id", "approach_lane", "spawn", "ground_route_reachable", "ground_route_length_tiles",
                 "ground_entry_reference", "air_vector_from_core", "straight_line_distance_tiles",
-                "existing_turret_route_engagements", "placement_sample_contract",
+                "existing_turret_route_engagements", "strategic_defense_zones", "placement_sample_contract",
                 "wall_placement_sample_contract",
             )
         } | {
             "valid_turret_placement_samples": turret_tables,
-            "valid_wall_placement_samples": wall_tables,
+            "valid_wall_placement_groups": list(wall_groups.values()),
         })
 
     return {
@@ -1419,7 +1715,8 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
     compact = {
         key: state.get(key)
         for key in (
-            "episode_id", "result", "self_team", "wave", "wave_time_remaining_seconds",
+            "episode_id", "observed_at", "playing", "game_over", "result", "tick",
+            "self_team", "wave", "wave_time_remaining_seconds",
             "map", "rules", "game_mode_variant", "pvp_fairness", "core", "cores", "core_defender", "defense_supply", "wave_forecast", "threat_summary", "enemy_spawns",
             "rts_construction_queue", "rts_training_queues", "rts_upgrade_queues",
             "rts_battlefield", "rts_control_points", "rts_control_benefits", "rts_squads", "recent_unit_command_receipts",
@@ -1427,6 +1724,7 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
             "power_networks", "power_node_topology", "action_contract", "infrastructure_backlog", "recent_defense_outcomes",
         )
     }
+    compact["recent_unit_combat"] = _compact_recent_unit_combat(state.get("recent_unit_combat"))
     if stockpile_rts:
         for key in (
             "power_networks", "power_node_topology", "defense_supply",
@@ -1481,15 +1779,29 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
         ]
         construction_active = [
             row for row in construction if row.get("status") not in {
-                "completed", "cancelled_invalid_at_completion", "cancelled"
+                "completed", "completed_then_destroyed", "cancelled_invalid_at_completion",
+                "cancelled", "cancelled_by_agent",
             }
         ]
         construction_finished = [row for row in construction if row not in construction_active]
-        compact["rts_construction_queue"] = construction_active + construction_finished[-3:]
+        destroyed_after_completion = [
+            row for row in construction if row.get("status") == "completed_then_destroyed"
+        ]
+        # Finished rows are history, not usable facilities. Keeping their coordinates beside the
+        # live production catalog caused models to issue orders to structures that no longer exist.
+        compact["rts_construction_queue"] = construction_active
         compact["rts_queue_history_summary"]["rts_construction_queue"] = {
             "active_count": len(construction_active),
             "finished_count": len(construction_finished),
-            "recent_finished_rows_included": min(3, len(construction_finished)),
+            "completed_then_destroyed_count": len(destroyed_after_completion),
+            "recent_destroyed": [
+                {key: row.get(key) for key in ("block", "x", "y")}
+                for row in destroyed_after_completion[-3:]
+            ],
+            "facility_authority": (
+                "History is not usable capacity. Only facility_id values in "
+                "offensive_production.*.existing_instances are currently operable."
+            ),
         }
         compact["rts_squads"] = [
             squad for squad in state.get("rts_squads", []) if isinstance(squad, dict)
@@ -1710,6 +2022,12 @@ def compact_state(state: dict[str, Any]) -> dict[str, Any]:
         compact["nearby_ores_by_item"] = {}
         compact["offensive_production"] = _stockpile_rts_production_state(state, block_definitions)
         compact["rts_defense"] = _stockpile_rts_defense_state(state, block_definitions)
+        compact["rts_operational_summary"] = _stockpile_rts_operational_summary(
+            state, compact["offensive_production"], compact["pvp_objective"]
+        )
+        compact["rts_action_availability"] = _stockpile_rts_action_availability(
+            state, compact["offensive_production"]
+        )
     else:
         compact["currently_obtainable_resources"] = sorted(renewable_resources)
         compact["offensive_production"] = _offensive_production_state(

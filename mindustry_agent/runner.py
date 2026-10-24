@@ -355,6 +355,15 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
     health = game.health()
     state = game.state()
     episode_id = str(state.get("episode_id") or health.get("episode_id") or "unknown")
+    stockpile_rts = (
+        isinstance(state.get("game_mode_variant"), dict)
+        and state["game_mode_variant"].get("id") == "stockpile_rts_pvp"
+    )
+    cached_static_state = {
+        key: state[key]
+        for key in ("available_blocks",)
+        if key in state
+    }
     run_log = JsonlRunLog(config.run_dir, episode_id, config.llm_model)
     run_log.write({
         "kind": "run_start",
@@ -377,7 +386,8 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
 
     turns = 0
     while True:
-        state = game.state()
+        observed_state = game.state(profile="decision" if stockpile_rts else "full")
+        state = {**cached_static_state, **observed_state} if stockpile_rts else observed_state
         if str(state.get("episode_id")) != episode_id:
             previous = state.get("previous_episode_result")
             previous = previous if isinstance(previous, dict) else {}
@@ -465,7 +475,10 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
         }
         action_observed_tick = float(state.get("tick", 0))
         if not dry_run:
-            latest_before_action = game.state()
+            latest_observation = game.state(profile="execution" if stockpile_rts else "full")
+            latest_before_action = (
+                {**state, **latest_observation} if stockpile_rts else latest_observation
+            )
             latest_episode_id = str(latest_before_action.get("episode_id"))
             if (
                 latest_episode_id != episode_id
@@ -476,7 +489,7 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
                     "kind": "run_end",
                     "at": utc_now(),
                     "reason": "game_over_during_inference",
-                    "state": latest_before_action,
+                    "state": compact_state(latest_before_action),
                     "discarded_turn": turns,
                     "discarded_decision": decision,
                     "llm_latency_seconds": llm_result.latency_seconds,
@@ -531,7 +544,8 @@ def run(config: AgentConfig, *, once: bool, dry_run: bool, max_turns: int | None
             "at": utc_now(),
             "turn": turns,
             "episode_id": episode_id,
-            "state": state,
+            "state": compact_decision_state,
+            "state_profile": "decision_compact",
             "model_recent_unit_combat": state.get("recent_unit_combat"),
             "observed_events": observed_events,
             "infrastructure_backlog": infrastructure_backlog.for_prompt(),

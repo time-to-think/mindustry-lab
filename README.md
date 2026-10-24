@@ -11,9 +11,9 @@ The current showcase compares `glm-5.3-flash:cloud` as the Sharded team with `de
 - Sequential construction, parallel factory production, unit upgrades, persistent squads, rally points, attack, retreat, and defense commands.
 - Three symmetric but tactically different lanes: a wide northern maneuver lane, a short fortified center lane, and a long southern flank.
 - Three control points that provide strategic benefits but never end the match:
-  - North: 10% faster unit production and upgrading.
-  - Center: additional visibility into enemy queues and squad orders.
-  - South: local repair for friendly units and buildings.
+  - North: 15% more damage for all combat units on the owning team.
+  - Center: 15% more movement speed for all combat units on the owning team.
+  - South: incoming combat-unit damage is divided by 1.15 for the owning team.
 - Core destruction as the only victory condition.
 - A neutral spectator mode, live Korean HUD telemetry, unit-loss cleanup, JSONL match logs, response latency, and action-result tracking.
 

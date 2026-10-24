@@ -508,21 +508,19 @@ class PolicyTest(unittest.TestCase):
                 {"id": "south_advanced", "owner": "neutral"},
             ],
             "rts_control_benefits": {
-                "north_unit_training_and_upgrade_speed_bonus_fraction": 0.1,
-                "center_operational_intelligence_active": False,
-                "south_friendly_unit_repair_max_health_fraction_per_second_in_radius": 0.01,
-                "south_friendly_structure_repair_max_health_fraction_per_second_in_radius": 0.005,
+                "north_combat_unit_damage_multiplier": 1.15,
+                "center_combat_unit_speed_multiplier": 1.15,
+                "south_combat_unit_incoming_damage_divisor": 1.15,
                 "takeover_requires_neutralization": True,
                 "neutral_lock_seconds_after_enemy_neutralization": 5.0,
-                "current_production_and_upgrade_speed_multiplier": 1.1,
                 "teams": {
-                    "sharded": {"owned_points": 1, "production_and_upgrade_speed_multiplier": 1.1},
-                    "crux": {"owned_points": 1, "production_and_upgrade_speed_multiplier": 1.0},
+                    "sharded": {"owned_points": 1, "combat_unit_damage_multiplier": 1.15},
+                    "crux": {"owned_points": 1, "combat_unit_damage_multiplier": 1.0},
                 },
             },
             "rts_tactical_intelligence": {
                 "basic_battlefield_positions_are_always_complete": True,
-                "center_operational_intelligence_active": False,
+                "opponent_private_queues_are_disclosed": False,
                 "opponent_operational_intelligence": [],
             },
             "core": {"items": {"lead": 100, "silicon": 80}},
@@ -609,18 +607,26 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(benefits["direct_victory_effect"])
         self.assertEqual(benefits["owned_by_self"], 1)
         self.assertEqual(benefits["most_owned_by_one_opponent"], 1)
-        self.assertEqual(benefits["current_production_and_upgrade_speed_multiplier"], 1.1)
-        self.assertEqual(
-            benefits["south_friendly_unit_repair_max_health_fraction_per_second_in_radius"], 0.01
-        )
-        self.assertEqual(
-            benefits["south_friendly_structure_repair_max_health_fraction_per_second_in_radius"], 0.005
-        )
+        self.assertEqual(benefits["north_combat_unit_damage_multiplier"], 1.15)
+        self.assertEqual(benefits["center_combat_unit_speed_multiplier"], 1.15)
+        self.assertEqual(benefits["south_combat_unit_incoming_damage_divisor"], 1.15)
         self.assertTrue(benefits["takeover_requires_neutralization"])
         self.assertTrue(compact["rts_tactical_intelligence"]["basic_battlefield_positions_are_always_complete"])
         self.assertEqual(compact["rts_training_queues"][0]["remaining"], 3)
         self.assertEqual(compact["rts_upgrade_queues"][0]["remaining"], 1)
         self.assertEqual(compact["rts_construction_queue"][0]["status"], "queued")
+        construction_capacity = compact["rts_operational_summary"]["construction_capacity"]
+        self.assertEqual(construction_capacity["parallel_slots"], 2)
+        self.assertEqual(construction_capacity["pending_orders"], 1)
+        availability = compact["rts_action_availability"]
+        self.assertEqual(
+            availability["busy_factory_slots_do_not_accept_orders"][0]["facility_id"],
+            "factory:20:30",
+        )
+        self.assertEqual(
+            availability["busy_reconstructor_slots_do_not_accept_orders"][0]["facility_id"],
+            "reconstructor:50:30",
+        )
         self.assertNotIn("production_networks", compact)
         self.assertNotIn("logistics_analysis", compact)
         self.assertNotIn("power_networks", compact)
@@ -683,6 +689,65 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(unit_rows["mace"]["estimated_dps"], 42.0)
         self.assertEqual(unit_rows["dagger"]["weapon_traits"]["mounts"], 2)
         self.assertIn("capability_tags", unit_rows["dagger"])
+
+    def test_destroyed_completed_construction_is_history_not_capacity(self) -> None:
+        state = {
+            "rules": {"pvp": True},
+            "game_mode_variant": {"id": "stockpile_rts_pvp"},
+            "core": {"items": {}},
+            "rts_construction_queue": [{
+                "block": "ground-factory", "x": 48, "y": 40,
+                "status": "completed_then_destroyed", "current_building_exists": False,
+                "currently_usable": False, "construction_slot": 1,
+            }, {
+                "block": "cyclone", "x": 30, "y": 40, "status": "queued",
+                "construction_slot": 2, "seconds_until_completion": 4.0,
+            }],
+        }
+
+        compact = compact_state(state)
+
+        self.assertEqual(len(compact["rts_construction_queue"]), 1)
+        self.assertEqual(compact["rts_construction_queue"][0]["block"], "cyclone")
+        history = compact["rts_queue_history_summary"]["rts_construction_queue"]
+        self.assertEqual(history["completed_then_destroyed_count"], 1)
+        self.assertEqual(history["recent_destroyed"], [{
+            "block": "ground-factory", "x": 48, "y": 40,
+        }])
+        self.assertIn("existing_instances", history["facility_authority"])
+        construction = compact["rts_operational_summary"]["construction_capacity"]
+        self.assertEqual(construction["occupied_slots"], 1)
+        self.assertEqual(construction["next_completions"][0]["construction_slot"], 2)
+
+    def test_rts_action_availability_exposes_exact_duplicate_gates(self) -> None:
+        state = {
+            "rules": {"pvp": True},
+            "game_mode_variant": {"id": "stockpile_rts_pvp"},
+            "core": {"items": {}},
+            "friendly_units": [
+                {"id": 10, "type": "dagger", "commandable": True},
+                {"id": 11, "type": "dagger", "commandable": True},
+                {"id": 99, "type": "gamma", "commandable": True},
+            ],
+            "core_defender": {"active": True, "id": 99},
+            "rts_squads": [{
+                "squad_id": "alpha", "mode": "attack_move", "member_ids": [10],
+                "member_count": 1, "pending_training_units": 2,
+                "target": {"x": 84, "y": 40}, "engagement_radius": 14,
+                "execution_status": "moving",
+            }],
+        }
+
+        compact = compact_state(state)
+        availability = compact["rts_action_availability"]
+
+        signature = availability["active_persistent_order_signatures_do_not_repeat"][0]
+        self.assertEqual(signature["squad_id"], "alpha")
+        self.assertEqual(signature["target_x"], 84)
+        self.assertEqual(signature["pending_training_units"], 2)
+        self.assertEqual(
+            availability["unassigned_commandable_unit_ids_by_type"], {"dagger": [11]}
+        )
 
     def test_stockpile_rts_exposes_unranked_turret_wall_and_ammo_facts(self) -> None:
         state = {
@@ -752,11 +817,42 @@ class PolicyTest(unittest.TestCase):
         approach = compact["rts_defense"]["approach_directions"][0]
         self.assertEqual(approach["valid_turret_placement_samples"]["duo"]["rows"][0][0:2], [20, 10])
         self.assertNotIn("arc", approach["valid_turret_placement_samples"])
-        self.assertEqual(
-            approach["valid_wall_placement_samples"]["copper-wall"]["rows"][0],
-            [18, 10, 8],
-        )
+        wall_group = approach["valid_wall_placement_groups"][0]
+        self.assertEqual(wall_group["compatible_walls"], ["copper-wall"])
+        self.assertEqual(wall_group["rows"][0], [18, 10, 8, None, None])
         self.assertEqual(compact["immediate_evidence_digest"]["defense_totals"]["walls"], 1)
+        self.assertIn("rts_operational_summary", compact)
+        self.assertEqual(
+            compact["rts_operational_summary"]["coordination"]["combat_squads_with_1_or_2_members"],
+            0,
+        )
+
+    def test_compacts_individual_combat_hits_but_keeps_recent_outcomes(self) -> None:
+        events = [
+            {"seconds_ago": 10 - index, "attacker_unit": "dagger", "target_type": "mace",
+             "raw_damage": 10, "x": index, "y": 4}
+            for index in range(10)
+        ]
+        compact = compact_state({
+            "rules": {"pvp": True},
+            "recent_unit_combat": {
+                "meaning": "combat facts",
+                "self": {
+                    "team": "sharded",
+                    "last_10_seconds": {"raw_damage": 100, "hits": 10,
+                                        "by_attacker_unit": [{"unit": "dagger", "damage": 100}]},
+                    "last_30_seconds": {"raw_damage": 100, "hits": 10,
+                                        "by_attacker_unit": [{"unit": "dagger", "damage": 100}]},
+                    "recent_events": events,
+                    "recent_events_omitted": 0,
+                },
+                "opponents": [],
+            },
+        })
+        combat = compact["recent_unit_combat"]["self"]
+        self.assertEqual(combat["last_10_seconds"]["raw_damage"], 100)
+        self.assertEqual(len(combat["recent_events"]), 6)
+        self.assertEqual(combat["recent_events_omitted"], 4)
 
     def test_exposes_attack_unit_production_requirements_without_a_build_order(self) -> None:
         state = {

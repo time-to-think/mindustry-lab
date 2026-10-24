@@ -57,11 +57,10 @@ Stockpile RTS strategic frame (causal guidance, never a build order):
 - Construction and training still expose their actual costs. Decide how to use build time, factory slots, unit
   composition, parallel production, replacements, and battlefield position; those are the intended constraints.
 - rts_control_points are neutral territory objectives captured by uncontested combat-unit presence. They never satisfy
-  the victory condition and provide no resource income. Secure north control gives 10% faster unit training and
-  upgrading. Secure center control adds exact opponent construction/training/upgrade queues and squad orders under
-  rts_tactical_intelligence; basic current unit/building positions remain fully visible to both teams without it.
-  Secure south control repairs friendly combat units by 1% and friendly structures by 0.5% of maximum health per
-  second inside its radius. A benefit is inactive while capture is in progress or contested. Hostile takeover first
+  the victory condition and provide no resource income. Secure north control increases damage dealt by every combat
+  unit on the owning team by 15%. Secure center control increases movement speed of every combat unit on the owning
+  team by 15%. Secure south control divides incoming damage to every combat unit on the owning team by 1.15. These
+  are team-wide effects, not radius-limited effects. A benefit is inactive while capture is in progress or contested. Hostile takeover first
   neutralizes the point, followed by a five-second forced-neutral lock before either team can capture it. Additional
   friendly occupants accelerate either capture stage only up to 1.5x. Each point reports its benefit, capture phase,
   neutral-lock time, ownership/progress, and local force presence; rts_control_benefits summarizes currently active
@@ -79,15 +78,18 @@ Stockpile RTS strategic frame (causal guidance, never a build order):
   with forced turns. Solid neutral terrain blocks ground passage and direct firing lines, while flying units can use
   direct air-only shortcuts across it. Decide whether to concentrate, split, feint, rotate lanes, defend a choke, contest an
   advantageous point, or bypass terrain from the current forces and opponent. No lane, force ratio, or opening is preferred.
-- Every place request reserves its cost immediately and enters your team's single sequential construction queue at
-  the block's standard build time. rts_construction_queue shows pending coordinates and completion times. A long JSON
-  list is therefore a strategic queue, not instant parallel construction; do not train from a queued factory until its
+- Every place request reserves its cost immediately and enters the earliest of your team's two parallel construction
+  slots at the block's standard build time. Each slot remains sequential. rts_construction_queue shows pending
+  coordinates, assigned slots, and completion times; do not train from a queued factory until its
   status is completed and the building appears. A later action in the same response does not wait for queued
   construction: training, upgrading, or turret resupply aimed at that new structure will run before it exists and do
   nothing or fail. Observe the completed building in a later state before operating it. The opponent has the identical
   construction executor.
+- Finished construction history is not usable capacity, and completed_then_destroyed means the finished structure was
+  subsequently lost. For train_units and upgrade_units, only facility_id values present in the current
+  offensive_production existing_instances are legal; never reconstruct a facility reference from queue coordinates.
 - The action limit is not a target and an empty stockpile is not evidence of good play. Every extra placement commits
-  future construction time and delays everything behind it. Before adding production buildings, compare currently
+  future construction time in one slot and can delay later work assigned to that slot. Before adding production buildings, compare currently
   existing free slots, active paid queues, expected near-term output, and the opponent's present force. Enqueue only
   infrastructure whose role is justified by current evidence; do not fill the construction queue with speculative
   copies intended for a distant phase.
@@ -121,10 +123,18 @@ Stockpile RTS strategic frame (causal guidance, never a build order):
   not a required defense ratio, named-turret preference, wall count, threat threshold, or build order. Compare the
   opportunity cost of delaying production in the shared construction queue with the protection each structure can
   provide against the actual enemy units, weapons, approach, and target.
-- rts_defense.approach_directions treats each opposing core as a possible attack origin. Turret samples are exact,
-  currently valid anchors whose firing geometry intersects the shown ground or air path; wall samples are exact,
-  currently valid anchors on or near the current ground route. The rows are unranked. Walls absorb and redirect
-  ground pressure but do not shoot; after a wall completes, use the next observation because the ground route may move.
+- rts_defense.approach_directions exposes the possible attack entries. In stockpile RTS the three approach_lane rows
+  are separate north, center, and south routes from the neutral crossings toward your core; compare all three rather
+  than assuming the shortest center route is the only threat. Turret samples are exact, currently valid forward
+  anchors whose firing geometry intersects the shown ground or air path. Each sample reports
+  whether it lies between the core and the approach plus its factual base_gate, lane_screen, or forward_choke zone;
+  strategic_defense_zones marks representative route lines. Use these facts with actual range, enemy composition and
+  the line being protected instead of placing ground defense behind the core merely because a tile is empty. Rear
+  placement remains a legitimate deliberate choice for air interception, fallback protection, or a known flank through
+  ordinary placement options. valid_wall_placement_groups shares exact forward anchors among compatible walls with the
+  same footprint size instead of repeating identical coordinates for every wall material. The rows are unranked. Walls
+  absorb and redirect ground pressure but do not shoot; after a wall completes, use the next observation because the
+  ground route may move.
 - Item turrets begin without a guaranteed ammunition feed. Use resupply_turrets with a compatible item from the abundant
   core stockpile when you decide the resulting ammunition endurance is useful. In this RTS mode that explicit
   action transfers ammunition directly from the core without belts; it supplies matching owned turrets below the
@@ -152,12 +162,28 @@ Stockpile RTS strategic frame (causal guidance, never a build order):
   control points, select targets, attack infrastructure or cores, screen your base, retreat damaged forces, and adapt to the
   opponent's observed composition and defenses. Static defense can preserve production or shape a fight, but only
   mobile forces or weapons that can actually reach the opposing core can complete the victory objective.
+- rts_operational_summary joins the current force, pending production, factory utilization, squad coordination, and
+  enemy-core progress. In particular, compare combat_squads_with_1_or_2_members and
+  pending_reinforcements_attached_to_combat_orders: repeatedly sending each newly completed unit into the same hostile
+  route is observed trickle reinforcement, not force concentration. Decide from present travel time, opposition,
+  losses, health, and pending forces whether to keep the standing order, stage a separate reserve squad, change lane,
+  or commit a concentrated force. This is evidence, not a fixed minimum army size or attack threshold.
+- Cheap base units, upgraded units, mobile air, support traits, static defenses, and lane geometry are distinct tools.
+  Compare the factual unit_catalog and observed opponent rather than repeating only the first available plan. Progression
+  is not automatically correct either: an upgrade is valuable only when its time, input commitment, battlefield role,
+  and opportunity cost support the current strategy.
 - The actions array supports multiple independent actions in one response. Use that concurrency when several actions
   are executable from the same observation; they must not depend on a structure or unit that an earlier action in the
-  same response has not completed yet. No-action turns should be exceptional: wait only when an already-paid queue or
-  persistent order is producing the intended evidence and no other currently legal action would advance or protect
-  the current intent. Never submit an order to a busy slot, and never repeat an identical squad order. To reinforce
+  same response has not completed yet. A no-action turn is valid when an already-paid queue or persistent order is
+  producing the intended evidence and no other currently legal action would advance or protect the current intent;
+  do not invent a redundant command merely to avoid waiting. Never submit an order to a busy slot, and never repeat
+  an identical squad order. To reinforce
   that squad, provide the newly observed living unit_ids explicitly; otherwise give those units a distinct order.
+- rts_action_availability is the final current-turn feasibility checklist. Before returning JSON, compare every
+  train_units, upgrade_units, and command_units action against it. Busy facility IDs accept no new order. An exact
+  signature in active_persistent_order_signatures_do_not_repeat is already executing continuously; omit it unless
+  explicit new unit_ids change membership. Prefer an empty actions array over resubmitting a blocked or identical
+  command. This checklist removes redundant execution only and does not choose strategy for you.
 - action_failure_memory also includes model-authored actions rejected by feasibility preflight. If it reports
   standing_squad_order_already_active, that exact squad mode, target, engagement radius, and membership is already
   executing continuously. Do not submit the same signature again until observed evidence justifies a changed order;
@@ -522,8 +548,9 @@ Available action skills:
   completed, is still progressing, or should be replaced.
 - {"type":"place","block":name,"x":int,"y":int,"rotation":0..3} performs an exact placement of any block
   present in available_blocks; standard costs, bans, visibility, and placement rules still apply. In stockpile RTS it
-  reserves cost and enters rts_construction_queue instead of appearing immediately; one construction per team runs at
-  a time in agent-chosen queue order. Removing the coordinate before completion cancels it and refunds reserved cost.
+  reserves cost and enters rts_construction_queue instead of appearing immediately. Stockpile RTS has two parallel
+  construction slots per team; each slot remains sequential, and the engine assigns a new order to the slot that
+  becomes available first. Removing the coordinate before completion cancels it and refunds reserved cost.
 
 Use observed_events, recent_defense_outcomes, and the current-episode infrastructure backlog to decide whether
 rebuilding, replacing with a different design, repairing, or accepting the loss is appropriate.

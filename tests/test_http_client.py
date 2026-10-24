@@ -28,6 +28,21 @@ class MindustryClientTest(unittest.TestCase):
         sleep.assert_not_called()
 
     @patch("mindustry_agent.http_client.request_json")
+    def test_state_profile_is_sent_to_server(self, request_json) -> None:
+        request_json.return_value = {"state_profile": "execution"}
+        client = MindustryClient("http://127.0.0.1:8765", "token", "sharded")
+        self.assertEqual(client.state(profile="execution"), {"state_profile": "execution"})
+        self.assertEqual(
+            request_json.call_args.args[0],
+            "http://127.0.0.1:8765/v1/state?profile=execution",
+        )
+
+    def test_unknown_state_profile_is_rejected_locally(self) -> None:
+        client = MindustryClient("http://127.0.0.1:8765", "token", "sharded")
+        with self.assertRaises(ValueError):
+            client.state(profile="oversized")
+
+    @patch("mindustry_agent.http_client.request_json")
     def test_action_request_carries_optional_spectator_telemetry(self, request_json) -> None:
         request_json.return_value = {"ok": True, "results": []}
         client = MindustryClient("http://127.0.0.1:8765", "token", "sharded")

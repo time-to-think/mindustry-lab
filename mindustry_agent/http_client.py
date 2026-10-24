@@ -57,11 +57,15 @@ class MindustryClient:
     def health(self) -> dict[str, Any]:
         return request_json(f"{self.base_url}/health", headers=self.headers)
 
-    def state(self) -> dict[str, Any]:
+    def state(self, profile: str = "full") -> dict[str, Any]:
+        if profile not in {"full", "decision", "execution"}:
+            raise ValueError(f"Unknown state profile: {profile}")
         last_error: HttpJsonError | None = None
         for attempt in range(3):
             try:
-                return request_json(f"{self.base_url}/v1/state", headers=self.headers)
+                return request_json(
+                    f"{self.base_url}/v1/state?profile={profile}", headers=self.headers
+                )
             except HttpJsonError as error:
                 last_error = error
                 if error.status_code != 503 or attempt == 2:
